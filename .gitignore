@@ -1,0 +1,9 @@
+rt/
+bin/
+*.sublime-*
+.idea
+.pytest_cache
+__pycache__
+*.pyc
+*.swp
+data/
