@@ -66,9 +66,11 @@ def decide_targets(gt: torch.Tensor, prev: torch.Tensor,
     :param decider: long tensor of shape (B,)
     :return: the targets to be used in training
     """
+    device = gt.device
     aug = torch.stack((gt, prev))
     decider = (decider.reshape(1, decider.size(0), 1, 1, 1)
                * torch.ones(1, decider.size(0), *gt.shape[1:]).long())
+    decider = decider.to(device)
     actual = torch.gather(aug, 0, decider)
     return actual[0]
 
