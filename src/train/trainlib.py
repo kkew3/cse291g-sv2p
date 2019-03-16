@@ -49,6 +49,7 @@ def _l(*args):
 _Predicate = typing.Callable[[typing.Any], bool]
 _EBProgress = typing.Tuple[int, int]
 
+
 def action_fired(fired: typing.Union[int, _Predicate]) -> _Predicate:
     """
     Returns a callable that returns a bool indicating whether an action should
@@ -410,10 +411,10 @@ class BasicTrainer:
     | fired          | fired_always         | The firing policy of         |
     |                |                      | CheckpointSaver and          |
     |                |                      | StatSaver in loop train      |
-    | statdir_$STAGE | $basedir/stat_$STAGE | Directory to hold statistics |
+    | statdir_STAGE  | $basedir/stat_STAGE  | Directory to hold statistics |
     |                |                      | produced in loop STAGE other |
     |                |                      | than train                   |
-    | fired_$STAGE   | fired_always         | The firing policy of         |
+    | fired_STAGE    | fired_always         | The firing policy of         |
     |                |                      | StatSaver in loop STAGE      |
     |                |                      | other than train             |
     +----------------+----------------------+------------------------------+
@@ -460,10 +461,13 @@ class BasicTrainer:
                would be ``(E+1, 0)``, and will overwrite existing npy
                statistics and pth checkpoint files.
         :param freeze_net_when_necessary: if True, freeze the network
-               parameters whenever ``self.__stage`` is not 'train', and
+               parameters whenever ``stage`` is not 'train', and
                always freeze the network if there's no 'train' in
                ``self.run_stages``. Do not specify as ``True`` if in non-train
-               stages the network weights are used for backpropagation
+               stages the network weights are used for backpropagation. This
+               option can be useful if the inputs requires gradient
+               backpropagation, in which case ``torch.no_grad`` cannot be
+               used
         """
         self.device = device
         self.net = net
@@ -477,23 +481,6 @@ class BasicTrainer:
         self._origrg = {}
         """Used to freeze network when necessary"""
         self._frozen_always = False
-
-        # expose (readonly) current training progress
-        self.__stage: str = None  # current training stage
-        self.__epoch: int = None
-        self.__batch: int = None
-
-    @property
-    def stage(self):
-        return self.__stage
-
-    @property
-    def epoch(self):
-        return self.__epoch
-
-    @property
-    def batch(self):
-        return self.__batch
 
     @property
     def default_basedir(self):
@@ -625,6 +612,7 @@ class BasicTrainer:
         if self._frozen_always:
             self.freeze_net()
 
+    # pylint: disable=unused-argument
     def teardown(self, error: BaseException = None):
         """
         Callback before the return of ``run``, whether or not a successful
@@ -659,65 +647,55 @@ class BasicTrainer:
             epoch0 = 0
 
         try:
-            for self.__epoch in range(epoch0, self.max_epoch):
+            for epoch in range(epoch0, self.max_epoch):
                 self.before_epoch()
-                for self.__stage in self.run_stages:
-                    logger.debug('Begin stage {}'.format(self.__stage))
-                    if self.__stage == 'train':
+                for stage in self.run_stages:
+                    logger.debug('Begin stage {}'.format(stage))
+                    if stage == 'train':
                         self._trained_once = True
                         if (self.freeze_net_when_necessary
                                 and not self._frozen_always):
                             self.melt_net()
                         self.net.train()
-                        for self.__batch, it in enumerate(
-                                self.__get_loader(self.__stage)):
+                        for batch, it in enumerate(self.__get_loader(stage)):
                             # `it` is `(inputs, targets)`
-                            self.__before_batch(self.__stage)
-                            stats = self.__once(self.__stage, *it)
+                            self.__before_batch(stage)
+                            stats = self.__once(stage, *it)
                             if stats:
                                 stats_to_log = self._organize_stats(stats)
                                 stats_to_log_repr = list(stats_to_log.items())
                                 logger.info('epoch{}/{} batch{}: {}'
-                                            .format(self.__epoch, self.__stage,
-                                                    self.__batch,
+                                            .format(epoch, stage, batch,
                                                     stats_to_log_repr))
-                                statsaver = self.__statsaver(self.__stage)
-                                statsaver((self.__epoch, self.__batch),
-                                          **stats_to_log)
+                                statsaver = self.__statsaver(stage)
+                                statsaver((epoch, batch), **stats_to_log)
                             else:
                                 logger.info('epoch{}/{} batch{}'
-                                            .format(self.__epoch,
-                                                    self.__stage,
-                                                    self.__batch))
+                                            .format(epoch, stage, batch))
                             checkpointsaver = self.__checkpointsaver()
-                            checkpointsaver((self.__epoch, self.__batch))
-                            self.__after_batch(self.__stage)
+                            checkpointsaver((epoch, batch))
+                            self.__after_batch(stage)
                     else:
                         if (self.freeze_net_when_necessary
                                 and not self._frozen_always):
                             self.freeze_net()
                         self.net.eval()
-                        for self.__batch, it in enumerate(
-                                self.__get_loader(self.__stage)):
+                        for batch, it in enumerate(self.__get_loader(stage)):
                             # `it` is `(inputs, targets)`
-                            self.__before_batch(self.__stage)
-                            stats = self.__once(self.__stage, *it)
+                            self.__before_batch(stage)
+                            stats = self.__once(stage, *it)
                             if stats:
                                 stats_to_log = self._organize_stats(stats)
                                 stats_to_log_repr = list(stats_to_log.items())
                                 logger.info('epoch{}/{} batch{}: {}'
-                                            .format(self.__epoch, self.__stage,
-                                                    self.__batch,
+                                            .format(epoch, stage, batch,
                                                     stats_to_log_repr))
-                                statsaver = self.__statsaver(self.__stage)
-                                statsaver((self.__epoch, self.__batch),
-                                          **stats_to_log)
+                                statsaver = self.__statsaver(stage)
+                                statsaver((epoch, batch), **stats_to_log)
                             else:
                                 logger.info('epoch{}/{} batch{}'
-                                            .format(self.__epoch,
-                                                    self.__stage,
-                                                    self.__batch))
-                            self.__after_batch(self.__stage)
+                                            .format(epoch, stage, batch))
+                            self.__after_batch(stage)
                 self.after_epoch()
             logger.info('Returns successfully')
             self.teardown()
@@ -812,6 +790,7 @@ class BasicEvaluator(BasicTrainer):
     | stat_names | The names of statistics returned by STAGE_once |
     +------------+------------------------------------------------+
     """
+
     def __init__(self, net: nn.Module, progress: _EBProgress,
                  basedir: str, freeze_net_when_necessary: bool = False,
                  device: str = 'cpu'):
@@ -852,7 +831,7 @@ class BasicEvaluator(BasicTrainer):
                                       'exists; try setting a different name'
                                       .format(getattr(self, 'eval_basedir')))
         elif not os.path.samefile(os.path.commonprefix((
-            getattr(self, 'eval_basedir'), self.basedir)), self.basedir):
+                getattr(self, 'eval_basedir'), self.basedir)), self.basedir):
             raise ValueError('Expecting eval_basedir to be a child of '
                              'self.basedir "{}", but got "{}"'
                              .format(getattr(self, 'eval_basedir'),
