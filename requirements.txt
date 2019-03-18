@@ -4,5 +4,6 @@ numpy
 scipy
 matplotlib
 opencv-python
+tqdm
 
 pytest
