@@ -24,6 +24,22 @@ def broadcast_value2list(value: T1, iterable: typing.Iterable[T2]) \
     return map(lambda x: (value, x), iterable)
 
 
+# pylint: disable=W0231
+class ListSampler(torch.utils.data.Sampler):
+    """
+    Since list is not considered a Sampler although by duck typing it is, here
+    I wrap a list into a sampler.
+    """
+    def __init__(self, indices: typing.Sequence[int]):
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __iter__(self):
+        return iter(self.indices)
+
+
 class SlidingWindowBatchSampler(torch.utils.data.Sampler):
     """
     Samples in a sliding window manner.
@@ -39,7 +55,7 @@ class SlidingWindowBatchSampler(torch.utils.data.Sampler):
                larger than the length of ``indices`` or the length of one of
                the sublists, then that list won't be sampled
         :param shuffle: whether to shuffle sampling, but the indices order
-               within a window is never shuffle
+               within a window is never shuffled
         :param batch_size: how many batches to yield upon each sampling
         :param drop_last: True to drop the remaining batches if the number of
                remaining batches is less than ``batch_size``
@@ -78,7 +94,8 @@ class SlidingWindowBatchSampler(torch.utils.data.Sampler):
             ind_tosample = perm[i:i + self.batch_size]
             if not (len(ind_tosample) < self.batch_size and self.drop_last):
                 segid_startind_tosample = map(_gi, ind_tosample)
-                sampled_batches = map(self._sample_batch_once, segid_startind_tosample)
+                sampled_batches = map(self._sample_batch_once,
+                                      segid_startind_tosample)
                 yield list(np.concatenate(list(sampled_batches)))
 
     def _calc_sliding_distance(self, length):
