@@ -1,3 +1,4 @@
+import os
 import random
 import typing
 
@@ -34,3 +35,7 @@ def test_sample_kth(tmpdir):
 
     dataset = ld.KTH(wd=tmpdir)
     _test_sample_dataset(dataset, _assertion)
+    kthdir = os.listdir(os.path.join(os.environ['PYTORCH_DATA_HOME'], 'KTH'))
+    assert not [x for x in kthdir if x.endswith('.npy')]
+    dataset.teardown()
+    assert not [x for x in kthdir if x.endswith('.npy')]

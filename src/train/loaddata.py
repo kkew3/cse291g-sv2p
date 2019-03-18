@@ -70,15 +70,15 @@ class KTH(torch.utils.data.Dataset):
             os.environ['PYTORCH_DATA_HOME']), 'KTH')
         with open(os.path.join(self.datadir, 'kth.lst')) as infile:
             self.videolist = list(map(str.strip, infile))
-        self.__tempdir = tempfile.TemporaryDirectory(dir=wd)
-        self.__tempdir_name = self.__tempdir.name
+        self._tempdir = tempfile.TemporaryDirectory(dir=wd)
+        self._tempdir_name = self._tempdir.name
 
     def __len__(self):
         return len(self.videolist)
 
     def __getitem__(self, index):
         filename = os.path.join(self.datadir, self.videolist[index])
-        npyfile = os.path.join(self.__tempdir_name, filename)
+        npyfile = os.path.join(self._tempdir_name, os.path.basename(filename))
         try:
             v = np.load(npyfile)
         except FileNotFoundError:
@@ -95,5 +95,5 @@ class KTH(torch.utils.data.Dataset):
         self.teardown()
 
     def teardown(self):
-        self.__tempdir.cleanup()
-        self.__tempdir_name = None
+        self._tempdir.cleanup()
+        self._tempdir_name = None
