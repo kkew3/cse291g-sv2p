@@ -14,10 +14,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchvision.transforms as trans
 
+import train.more_sampler as more_sampler
 import train.trainlib
 import train.loaddata as ld
 import train.schesample as schesample
 from sv2p.ssim import DSSIM
+from sv2p.criteria import RotationInvarianceLoss
 import sv2p.cdna as cdna
 
 
@@ -36,52 +38,13 @@ def make_grid(n: int, col: int = 5) -> typing.Tuple[int, int]:
     return math.ceil(n / col), col
 
 
-# def schedule_teacher_forcing(batch_size: int, seqlen: int, n_gt: int, warm: int):
-#     """
-#     Returns a long tensor ``seqlen`` such that ``seqlen[b,t]==0`` means batch ``b`` at
-#     time step ``t`` requires teacher forcing.
-
-#     :param batch_size: the batch size
-#     :param seqlen: the temporal batch size
-#     :param n_gt: number of ground truth within each temporal batch
-#     :param warm: warm start size
-#     :return: long boolean tensor of shape (batch_size, seqlen)
-#     """
-#     if warm >= seqlen or n_gt >= seqlen:
-#         teacherf = np.zeros((batch_size, seqlen), dtype=np.int64)
-#     else:
-#         teacherf = np.zeros((batch_size, seqlen - warm), dtype=np.int64)
-#         teacherf[:, :seqlen - n_gt] = 1
-#         for i in range(teacherf.shape[0]):
-#             np.random.shuffle(teacherf[i])
-#         teacherf = np.concatenate((np.zeros((batch_size, warm), dtype=np.int64),
-#                                    teacherf), axis=1)
-#     return torch.tensor(teacherf).long()
-
-
-# def decide_targets(gt: torch.Tensor, prev: torch.Tensor,
-#                    decider: torch.Tensor) -> torch.Tensor:
-#     """
-#     :param gt: of shape (batch_size, C, H, W)
-#     :param prev: detached previous predictions of shape (batch_size, C, H, W)
-#     :param decider: long tensor of shape (batch_size,)
-#     :return: the targets to be used in training
-#     """
-#     device = gt.device
-#     aug = torch.stack((gt, prev))
-#     decider = (decider.reshape(1, decider.size(0), 1, 1, 1)
-#                * torch.ones(1, decider.size(0), *gt.shape[1:]).long())
-#     decider = decider.to(device)
-#     actual = torch.gather(aug, 0, decider)
-#     return actual[0]
-
-
 class CDNATrainer(train.trainlib.BasicTrainer):
     def __init__(self, in_channels: int, cond_channels: int, n_masks: int,
                  dataset_name: str,
                  indices: typing.Sequence[typing.Sequence[int]],
                  batch_size: int, lr: float, max_epoch: int,
                  seqlen: int, criterion_name: str,
+                 krireg: float, mfreg: float,
                  scheduled_sampling_k: float = None, warm_start: int = 2,
                  device: str = 'cpu'):
         """
@@ -102,6 +65,9 @@ class CDNATrainer(train.trainlib.BasicTrainer):
         :param max_epoch: max epoch to train
         :param seqlen: length of video sequence to sample
         :param criterion_name: one of: { "L1", "L2", "DSSIM" }
+        :param krireg: (k)ernel (r)otation (i)nvariance (reg)ularization
+               strength
+        :param mfreg: (m)ask (f)oreground (reg)ularization strength
         :param scheduled_sampling_k: if ``None``, do not use scheduled
                sampling, i.e. teacher forcing all the time. If specified as
                a float larger than 1.0, then inverse sigmoid decay of
@@ -126,6 +92,8 @@ class CDNATrainer(train.trainlib.BasicTrainer):
         self.lr = lr
         self.max_epoch = max_epoch
         self.criterion_name = criterion_name
+        self.krireg = krireg
+        self.mfreg = mfreg
         self.scheduled_sampling_k = scheduled_sampling_k
         self.warm_start = warm_start
         self.device = device
@@ -139,18 +107,13 @@ class CDNATrainer(train.trainlib.BasicTrainer):
                 ld.MovingMNIST.normalize,
             ]))
             self.denormalize = ld.MovingMNIST.denormalize
-            self.sam_train = ld.MovingMNIST.get_batch_sampler(
-                indices[0], self.seqlen, shuffle=True,
-                batch_size=self.batch_size)
-            self.sam_valid = ld.MovingMNIST.get_batch_sampler(
-                indices[1], self.seqlen, batch_size=self.batch_size)
+            self.sam_train = torch.utils.data.SubsetRandomSampler(indices[0])
+            self.sam_valid = more_sampler.ListSampler(indices[1])
             if len(indices) == 2:
-                self.sam_infer = ld.MovingMNIST.get_batch_sampler(
-                    indices[1], self.seqlen, batch_size=self.batch_size)
+                self.sam_infer = more_sampler.ListSampler(indices[1])
                 self.run_stages = 'train', 'valid', 'infer'
             elif indices[2]:
-                self.sam_infer = ld.MovingMNIST.get_batch_sampler(
-                    indices[2], self.seqlen, batch_size=self.batch_size)
+                self.sam_infer = more_sampler.ListSampler(indices[2])
                 self.run_stages = 'train', 'valid', 'infer'
             else:
                 self.run_stages = 'train', 'valid'
@@ -158,13 +121,14 @@ class CDNATrainer(train.trainlib.BasicTrainer):
             raise ValueError('Dataset "{}" not supported'
                              .format(dataset_name))
 
-        self.stat_names = ('loss',)
+        self.stat_names = 'predloss', 'kernloss', 'maskloss', 'loss'
         self.optimizer = optim.Adam(self.net.parameters(), lr=lr)
         self.criterion = {
             'L1': nn.L1Loss(),
             'L2': nn.MSELoss(),
             'DSSIM': DSSIM(self.net.in_channels),
         }[self.criterion_name].to(self.device)
+        self.kernel_criterion = RotationInvarianceLoss().to(self.device)
 
         # used to compute current global batch id when applying scheduled
         # sampling of targets
@@ -207,7 +171,8 @@ class CDNATrainer(train.trainlib.BasicTrainer):
         """
         _expected_size = (1, self.seqlen - 1, 64, 64)
         for frames in dataloader:
-            frames = ld.rearrange_temporal_batch(frames, self.seqlen)
+            assert len(frames.shape) == 5
+            frames = frames.transpose(1, 2)
             inputs, targets = frames[:, :, :-1], frames[:, :, 1:]
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
@@ -218,23 +183,34 @@ class CDNATrainer(train.trainlib.BasicTrainer):
     def get_trainloader(self):
         loader = None
         if self.dataset_name == 'MovingMNIST':
-            loader = DataLoader(self.dataset, batch_sampler=self.sam_train,
+            loader = DataLoader(self.dataset, sampler=self.sam_train,
+                                batch_size=self.batch_size,
                                 num_workers=2, pin_memory=True)
         yield from self.__get_loader(loader)
 
     def get_validloader(self):
         loader = None
         if self.dataset_name == 'MovingMNIST':
-            loader = DataLoader(self.dataset, batch_sampler=self.sam_valid,
+            loader = DataLoader(self.dataset, sampler=self.sam_valid,
+                                batch_size=self.batch_size,
                                 num_workers=2, pin_memory=True)
         yield from self.__get_loader(loader)
 
     def get_inferloader(self):
         loader = None
         if self.dataset_name == 'MovingMNIST':
-            loader = DataLoader(self.dataset, batch_sampler=self.sam_infer,
+            loader = DataLoader(self.dataset, sampler=self.sam_infer,
+                                batch_size=self.batch_size,
                                 num_workers=2, pin_memory=True)
         yield from self.__get_loader(loader)
+
+    def __compute_loss(self, predictions_t, cdna_kerns_t, masks_t, targets_t):
+        loss_t = self.criterion(predictions_t, targets_t)
+        kernloss_t = self.krireg * self.kernel_criterion(cdna_kerns_t)
+        maskloss_t = self.mfreg * masks_t[:, 1:] \
+            .reshape(-1, masks_t.size(-2) * masks_t.size(-1)) \
+            .abs().sum(1).mean()
+        return loss_t, kernloss_t, maskloss_t
 
     def train_once(self, inputs: torch.Tensor, targets: torch.Tensor):
         """
@@ -260,6 +236,8 @@ class CDNATrainer(train.trainlib.BasicTrainer):
 
         hidden = None
         loss = 0.0
+        kernloss = 0.0
+        maskloss = 0.0
         for t in range(inputs.size(2)):
             inputs_t = inputs[:, :, t]
             if decider is None:
@@ -273,42 +251,58 @@ class CDNATrainer(train.trainlib.BasicTrainer):
                     predictions_t = torch.zeros_like(targets[:, :, t])
                 targets_t = schesample.sample_targets(
                     predictions_t, targets[:, :, t], decider[:, t])
-            predictions_t, hidden, _, _ = self.net(
+            predictions_t, hidden, cdna_kerns_t, masks_t = self.net(
                 inputs_t, hidden_states=hidden)
-            loss_t = self.criterion(predictions_t, targets_t)
-
+            loss_t, kernloss_t, maskloss_t = self.__compute_loss(
+                predictions_t, cdna_kerns_t, masks_t, targets_t)
             loss += loss_t
-        loss /= float(seqlen)
+            kernloss += kernloss_t
+            maskloss += maskloss_t
+        total_loss = (loss + kernloss + maskloss) / seqlen
 
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         self.optimizer.step()
 
-        return (loss.detach().cpu().item(),)
+        return (
+            loss.detach().cpu().item() / seqlen,
+            kernloss.detach().cpu().item() / seqlen,
+            maskloss.detach().cpu().item() / seqlen,
+            total_loss.detach().cpu().item(),
+        )
 
     def valid_once(self, inputs: torch.Tensor, targets: torch.Tensor):
-        inputs_t: torch.Tensor
-        predictions_t: torch.Tensor
-        targets_t: torch.Tensor
+        seqlen = inputs.size(2)
 
         hidden = None
         loss = 0.0
+        kernloss = 0.0
+        maskloss = 0.0
 
         with torch.no_grad():
             for t in range(inputs.size(2)):
                 inputs_t, targets_t = inputs[:, :, t], targets[:, :, t]
-                predictions_t, hidden, _, _ = self.net(
+                predictions_t, hidden, cdna_kerns_t, masks_t = self.net(
                     inputs_t, hidden_states=hidden)
-                loss_t = self.criterion(predictions_t, targets_t)
-
+                loss_t, kernloss_t, maskloss_t = self.__compute_loss(
+                    predictions_t, cdna_kerns_t, masks_t, targets_t)
                 loss += loss_t
-            loss /= float(inputs.size(2))
+                kernloss += kernloss_t
+                maskloss += maskloss_t
+            total_loss = (loss + kernloss + maskloss) / seqlen
 
-        return (loss.detach().cpu().item(),)
+        return (
+            loss.detach().cpu().item() / seqlen,
+            kernloss.detach().cpu().item() / seqlen,
+            maskloss.detach().cpu().item() / seqlen,
+            total_loss.detach().cpu().item(),
+        )
 
     def infer_once(self, inputs: torch.Tensor, targets: torch.Tensor):
         hidden = None
         loss = 0.0
+        kernloss = 0.0
+        maskloss = 0.0
         predictions = []
         kerns = []
         masks = []
@@ -326,20 +320,23 @@ class CDNATrainer(train.trainlib.BasicTrainer):
                     except NameError:
                         # if `predictions_t` is not yet available
                         inputs_t = torch.zeros_like(inputs[:, :, 0])
-                predictions_t, hidden, kerns_t, masks_t = self.net(
+                predictions_t, hidden, cdna_kerns_t, masks_t = self.net(
                     inputs_t, hidden_states=hidden)
-                loss_t = self.criterion(predictions_t, targets_t)
-
+                loss_t, kernloss_t, maskloss_t = self.__compute_loss(
+                    predictions_t, cdna_kerns_t, masks_t, targets_t)
                 loss += loss_t
+                kernloss += kernloss_t
+                maskloss += maskloss_t
+
                 predictions.append(predictions_t.detach().cpu())
-                kerns.append(kerns_t)
-                masks.append(masks_t)
-            loss /= float(seqlen)
+                kerns.append(cdna_kerns_t.detach().cpu())
+                masks.append(masks_t.detach().squeeze(2).cpu())
+            total_loss = (loss + kernloss + maskloss) / seqlen
 
         # visualization
-        # preprocessing: reshape to predictions and targets to (batch_size, C, seqlen, H, W)
-        #                reshape kerns to (batch_size, M, seqlen, H, W)
-        #                reshape masks to (batch_size, M+1, seqlen, H, W)
+        # preprocessing: reshape to predictions and targets to (B, C, T, H, W)
+        #                reshape kerns to (B, M, T, H, W)
+        #                reshape masks to (B, M+1, T, H, W)
         predictions = self.__organize_tensor_to_imgs(
             torch.stack(predictions, dim=2))
         targets = self.__organize_tensor_to_imgs(targets.detach().cpu())
@@ -354,7 +351,12 @@ class CDNATrainer(train.trainlib.BasicTrainer):
         tofile = os.path.join(statdir_infer, 'imgs.zip')
         self.__save_visualization(predictions, targets, kerns, masks,
                                   tofile)
-        return (loss.detach().cpu().item(),)
+        return (
+            loss.detach().cpu().item() / seqlen,
+            kernloss.detach().cpu().item() / seqlen,
+            maskloss.detach().cpu().item() / seqlen,
+            total_loss.detach().cpu().item(),
+        )
 
     def __save_visualization(self, predictions, targets, kerns, masks,
                              tofile):
@@ -434,8 +436,7 @@ class CDNAInference(train.trainlib.BasicEvaluator):
                 ld.MovingMNIST.normalize,
             ]))
             self.denormalize = ld.MovingMNIST.denormalize
-            self.sam_infer = ld.MovingMNIST.get_batch_sampler(
-                indices, self.seqlen, batch_size=self.batch_size)
+            self.sam_infer = more_sampler.ListSampler(indices)
         else:
             raise ValueError('Dataset "{}" not supported'
                              .format(dataset_name))
@@ -448,7 +449,8 @@ class CDNAInference(train.trainlib.BasicEvaluator):
         """
         _expected_size = (1, self.seqlen - 1, 64, 64)
         for frames in dataloader:
-            frames = ld.rearrange_temporal_batch(frames, self.seqlen)
+            assert len(frames.shape) == 5
+            frames = frames.transpose(1, 2)
             inputs, targets = frames[:, :, :-1], frames[:, :, 1:]
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
@@ -459,7 +461,8 @@ class CDNAInference(train.trainlib.BasicEvaluator):
     def get_inferloader(self):
         loader = None
         if self.dataset_name == 'MovingMNIST':
-            loader = DataLoader(self.dataset, batch_sampler=self.sam_infer,
+            loader = DataLoader(self.dataset, sampler=self.sam_infer,
+                                batch_size=self.batch_size,
                                 num_workers=2, pin_memory=True)
         yield from self.__get_loader(loader)
 

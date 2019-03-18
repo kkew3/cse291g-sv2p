@@ -256,8 +256,7 @@ class CDNA(nn.Module):
                  the new hidden states, the CDNA kernels of shape
                  ``(B, n_masks, 5, 5)``, and the masks of shape
                  ``(B, n_masks+1, H, W)`` where ``masks[:, 0]`` is the
-                 background mask. The last two return values have been
-                 detached and put back to CPU
+                 background mask
         """
         embeddings, rfeatures, new_hidden_states = \
             self.u_lstm(inputs, conditions=conditions,
@@ -268,17 +267,14 @@ class CDNA(nn.Module):
         transformed_inputs, cdna_kerns = self.transform_inputs(
             inputs, embeddings.reshape(embeddings.size(0), -1), self.n_masks)
         # transform_inputs shape: (B, M, C, H, W)
-        cdna_kerns_exported = cdna_kerns.detach().cpu()
         components = torch.cat((inputs.unsqueeze(1),
                                 transformed_inputs), dim=1)
         # components shape: (B, M+1, C, H, W)
 
         masks = F.softmax(self.convt7(rfeatures), dim=1).unsqueeze(2)
-        masks_exported = masks.detach().cpu().squeeze(2)
         # masks shape: (B, M+1, H, W)
         predictions = torch.sum(components * masks, dim=1)
-        return (predictions, new_hidden_states,
-                cdna_kerns_exported, masks_exported)
+        return predictions, new_hidden_states, cdna_kerns, masks
 
     def transform_inputs(self, inputs: torch.Tensor,
                          cdna_inputs: torch.Tensor, n_masks: int):
